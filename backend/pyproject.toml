@@ -30,6 +30,8 @@ dependencies = [
     "numpy>=1.26",
     # Spreadsheet export (§3.9.4 XLSX)
     "openpyxl>=3.1",
+    # NTP clock sync probe (§3.1.10, §3.1.11)
+    "ntplib>=0.4",
     # insightface + onnxruntime are optional — see README. They often lag
     # the latest CPython, so we do not pin them in the core deps. Install
     # separately:  pip install insightface onnxruntime

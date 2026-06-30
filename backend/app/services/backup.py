@@ -169,6 +169,9 @@ def _atomic_file_replace(src: Path, dst: Path, attempts: int = 20, delay: float 
                         sidecar.unlink()
                     except OSError:
                         pass
+            # In-place write leaves `src` behind; unlink it so the
+            # `.restoring` temp file does not linger on disk.
+            src.unlink(missing_ok=True)
             return
         except PermissionError as exc:
             last_exc = exc
@@ -243,15 +246,22 @@ def restore_backup(zip_path: Path, *, confirm: bool) -> tuple[bool, str, str | N
     try:
         with zipfile.ZipFile(zip_path) as zf:
             tmp_db = DB_PATH.with_suffix(".restoring")
-            with zf.open(DB_FILENAME) as src, open(tmp_db, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            # Replace the target DB file. Tries os.replace; on Windows if
-            # any process holds the destination, falls back to truncating
-            # and writing contents in place.
-            _atomic_file_replace(tmp_db, DB_PATH)
-            if kind == "full":
-                _extract_tree(zf, "snapshots", SNAPSHOT_DIR)
-                _extract_tree(zf, "enrollment", ENROLLMENT_DIR)
+            try:
+                with zf.open(DB_FILENAME) as src, open(tmp_db, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                # Replace the target DB file. Tries os.replace; on Windows
+                # if any process holds the destination, falls back to
+                # truncating and writing contents in place.
+                _atomic_file_replace(tmp_db, DB_PATH)
+                if kind == "full":
+                    _extract_tree(zf, "snapshots", SNAPSHOT_DIR)
+                    _extract_tree(zf, "enrollment", ENROLLMENT_DIR)
+            except Exception:
+                # Don't leave a stale .restoring file behind — it would
+                # confuse subsequent test runs and is never the canonical
+                # DB on disk anyway.
+                tmp_db.unlink(missing_ok=True)
+                raise
     finally:
         # Restart the engine.
         try:

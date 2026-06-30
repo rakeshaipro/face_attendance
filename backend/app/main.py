@@ -16,7 +16,7 @@ import asyncio
 import contextlib
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -80,6 +80,13 @@ async def lifespan(app: FastAPI):
     with SessionLocal() as db:
         register_backup_jobs(db)
 
+    # Phase 8: monitoring jobs (§3.11) + retention (§3.12.3–3.12.6).
+    from app.api.v1.monitoring import register_monitoring_jobs
+    register_monitoring_jobs()
+
+    from app.workers.camera_watcher import watcher as camera_offline_watcher
+    camera_offline_watcher.start()
+
     logger.info("Face Attendance backend %s started", __version__)
     try:
         yield
@@ -89,6 +96,7 @@ async def lifespan(app: FastAPI):
             from app.services.system_log import write_system_log
             write_system_log(db, event="app.shutdown", message="Face Attendance backend stopping")
         await webhook_dispatcher.stop()
+        camera_offline_watcher.stop()
         service.stop()
         scheduler_worker.shutdown()
         bus.set_loop(None)
@@ -117,6 +125,15 @@ def create_app() -> FastAPI:
     app.include_router(api_router)
 
     app.mount("/media/enrollment", StaticFiles(directory=str(ENROLLMENT_DIR)), name="enrollment-media")
+
+    @app.exception_handler(HTTPException)
+    async def http_exception(_: Request, exc: HTTPException) -> JSONResponse:
+        # Normalise FastAPI's {"detail": ...} into the app's standard envelope
+        # (SRS §4.3) so clients always read `error` from the response. Without
+        # this, capture/pose-check failures (HTTPException(400, detail=...))
+        # would return {"detail": "..."} and the real message would be lost.
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return JSONResponse(status_code=exc.status_code, content=fail(detail))
 
     @app.exception_handler(Exception)
     async def unhandled(_: Request, exc: Exception) -> JSONResponse:

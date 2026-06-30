@@ -16,7 +16,7 @@ Endpoints (mounted under /employees/{employee_id}/face)
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, UploadFile
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -28,6 +28,7 @@ from app.models import ApiKey, Employee, FaceEmbedding
 from app.schemas.common import Envelope
 from app.schemas.enrollment import (
     CaptureOut,
+    CaptureSummary,
     EnrollmentStatus,
     FinalizeResult,
     PoseCheckResult,
@@ -149,17 +150,31 @@ def capture(
 
 
 # --- §3.3.19 captures summary -------------------------------------------
-@router.get("/captures", response_model=Envelope[list])
+@router.get("/captures", response_model=Envelope[list[CaptureSummary]])
 def captures(
     employee_id: str,
     db: Session = Depends(get_db),
     _: ApiKey = Depends(require_readonly),
 ):
-    from app.schemas.enrollment import CaptureSummary
-
     emp = _employee(db, employee_id)
     rows = enrollment_svc._list_captures(db, emp.id)
     return Envelope(data=[enrollment_svc._step_summary(r) for r in rows])
+
+
+# --- per-step capture removal (re-capture a single pose) -----------------
+@router.delete("/captures/{step}", response_model=Envelope[dict])
+def remove_capture(
+    employee_id: str,
+    step: int = Path(..., ge=1, le=7),
+    db: Session = Depends(get_db),
+    api_key: ApiKey = Depends(require_readwrite),
+):
+    emp = _employee(db, employee_id)
+    try:
+        enrollment_svc.remove_step(db, emp, step, api_key.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return Envelope(data={"removed": True, "step": step, "employee_id": emp.employee_id})
 
 
 # --- §3.3.19/§3.3.20 finalize -------------------------------------------

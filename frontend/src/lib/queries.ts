@@ -2,11 +2,14 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 import type {
   AttendanceLog,
+  Backup,
+  BackupScheduleConfig,
   BulkImportResult,
   CameraSettings,
   CameraSettingsUpdate,
   CameraTestResult,
   CaptureOut,
+  CaptureSummary,
   DeviceInfo,
   Employee,
   EngineStats,
@@ -14,9 +17,16 @@ import type {
   FinalizeResult,
   HealthSummary,
   ManualEntryBody,
+  MonitoringStatus,
+  NtpResult,
   PoseCheckResult,
   PoseProtocol,
   PoseStep,
+  RestoreResult,
+  SystemLogRow,
+  SystemLogsParams,
+  TimeInfo,
+  TimeUpdate,
   VerifyResult,
 } from "./types";
 
@@ -33,6 +43,9 @@ export const qk = {
   enrollmentCaptures: (id: string) => ["enrollment", id, "captures"] as const,
   attendance: (params?: object) => ["attendance", params ?? {}] as const,
   attendanceToday: (params?: object) => ["attendance", "today", params ?? {}] as const,
+  backups: ["backups"] as const,
+  backupSchedule: ["backups", "schedule"] as const,
+  systemLogs: (params?: object) => ["system_logs", params ?? {}] as const,
 };
 
 // --- Health / device ----------------------------------------------------
@@ -160,7 +173,7 @@ export const useEnrollmentStatus = (id: string | undefined) =>
 export const useCapturesSummary = (id: string | undefined) =>
   useQuery({
     queryKey: qk.enrollmentCaptures(id ?? ""),
-    queryFn: () => api.get<CaptureOut[]>(`/api/v1/employees/${id}/face/captures`),
+    queryFn: () => api.get<CaptureSummary[]>(`/api/v1/employees/${id}/face/captures`),
     enabled: !!id,
   });
 
@@ -215,6 +228,19 @@ export const useRemoveFace = (employeeId: string) => {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => api.del<{ removed: boolean }>(`/api/v1/employees/${employeeId}/face`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.enrollmentStatus(employeeId) });
+      qc.invalidateQueries({ queryKey: qk.enrollmentCaptures(employeeId) });
+      qc.invalidateQueries({ queryKey: qk.employee(employeeId) });
+    },
+  });
+};
+
+export const useRemoveCapture = (employeeId: string) => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (step: number) =>
+      api.del<{ removed: boolean; step: number }>(`/api/v1/employees/${employeeId}/face/captures/${step}`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.enrollmentStatus(employeeId) });
       qc.invalidateQueries({ queryKey: qk.enrollmentCaptures(employeeId) });
@@ -514,17 +540,104 @@ export const useResendBatch = () => {
   });
 };
 
+// --- Time (§3.1.10, §3.1.11) ------------------------------------------
+// Poll every 60s so the live clock can recompute its server-vs-browser
+// skew without per-second requests; the component ticks locally each 1s.
+export const useTime = () =>
+  useQuery({
+    queryKey: ["time"],
+    queryFn: () => api.get<TimeInfo>("/api/v1/time"),
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
+  });
+
+export const useUpdateTime = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: TimeUpdate) => api.put<TimeInfo>("/api/v1/time", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["time"] }),
+  });
+};
+
+export const useNtpSync = () =>
+  useMutation({
+    mutationFn: () => api.post<NtpResult>("/api/v1/time/ntp-sync"),
+  });
+
+// --- Backups & system logs (§3.10, §3.12) ------------------------------
+export const useBackups = () =>
+  useQuery({ queryKey: qk.backups, queryFn: () => api.get<Backup[]>("/api/v1/backup") });
+
+export const useBackupSchedule = () =>
+  useQuery({ queryKey: qk.backupSchedule, queryFn: () => api.get<BackupScheduleConfig>("/api/v1/backup/schedule") });
+
+export const useUpdateBackupSchedule = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: BackupScheduleConfig) => api.put<BackupScheduleConfig>("/api/v1/backup/schedule", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.backupSchedule }),
+  });
+};
+
+export const useCreateBackup = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (kind: "full" | "database") => api.post<Backup>("/api/v1/backup", { kind }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.backups }),
+  });
+};
+
+export const useDeleteBackup = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.del<{ deleted: string }>(`/api/v1/backup/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.backups }),
+  });
+};
+
+export const useRestoreBackup = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (file: File) =>
+      api.upload<RestoreResult>("/api/v1/backup/restore", file, file.name, { confirm: true }),
+    onSuccess: () => {
+      // A successful restore replaces the DB — invalidate everything that
+      // reads from it. health/attendance cover the operator-visible state.
+      qc.invalidateQueries({ queryKey: ["backups"] });
+      qc.invalidateQueries({ queryKey: ["system_logs"] });
+      qc.invalidateQueries({ queryKey: ["health"] });
+      qc.invalidateQueries({ queryKey: ["employees"] });
+      qc.invalidateQueries({ queryKey: ["attendance"] });
+    },
+  });
+};
+
+export const useSystemLogs = (params: SystemLogsParams) =>
+  useQuery({
+    queryKey: qk.systemLogs(params),
+    queryFn: () =>
+      api.get<{ items: SystemLogRow[]; total: number; page: number; limit: number }>(
+        "/api/v1/system/logs",
+        params as Record<string, unknown>,
+      ),
+    placeholderData: (prev) => prev,
+  });
+
+// --- Monitoring (§3.11) ------------------------------------------------
+export const useMonitoringStatus = () =>
+  useQuery({
+    queryKey: ["monitoring", "status"],
+    queryFn: () => api.get<MonitoringStatus>("/api/v1/monitoring/status"),
+    refetchInterval: 30_000,
+  });
+
 // --- Generic settings (read/write key-value pairs from /api/v1/settings)
-// Phase 7 doesn't include the settings read/write endpoint yet — the
-// hooks below carry the SHAPE Device.tsx / System.tsx already expect so
-// they type-check; the runtime path will be filled in when /api/v1/settings
-// lands (Phase 8 placeholder work).
 import type { SettingItem, SettingUpdateResult, SettingsUpdate } from "./types";
 
 export function useAllSettings() {
   return useQuery({
     queryKey: ["settings", "all"],
-    queryFn: async () => ({ items: [] as SettingItem[] }),
+    queryFn: () => api.get<{ items: SettingItem[] }>("/api/v1/settings"),
   });
 }
 
@@ -532,8 +645,7 @@ export function useUpdateSettings() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (updates: SettingsUpdate[]): Promise<{ items: SettingUpdateResult[] }> => {
-      // TODO(phase 8): wire to PUT /api/v1/settings once that endpoint exists.
-      throw new Error("Settings update endpoint not yet implemented (Phase 8)");
+      return api.put<{ items: SettingUpdateResult[] }>("/api/v1/settings", { items: updates });
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
   });

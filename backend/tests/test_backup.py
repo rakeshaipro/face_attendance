@@ -71,52 +71,51 @@ def test_restore_valid_zip_overwrites_db(client, admin_headers):
     from app.db import SessionLocal
     from app.models import SystemSetting
 
-    with SessionLocal() as db:
-        db.add(SystemSetting(key="__restore_marker__", value="BEFORE"))
-        db.commit()
-
-    create = client.post("/api/v1/backup", headers=admin_headers, json={"kind": "database"})
-    bid = create.json()["data"]["id"]
-
-    # Add the marker AFTER the backup so the backup doesn't contain it.
-    with SessionLocal() as db:
-        db.add(SystemSetting(key="__restore_marker2__", value="AFTER"))
-        db.commit()
-
-    # Free all DB connections so the restore can overwrite the file
-    # (Windows holds the file handle while the pool keeps connections).
-    from app.db import engine as db_engine
-    db_engine.dispose()
-
-    dl = client.get(f"/api/v1/backup/{bid}", headers=admin_headers)
-
-    r = client.post(
-        "/api/v1/backup/restore?confirm=true",
-        headers=admin_headers,
-        files={"file": ("b.zip", io.BytesIO(dl.content), "application/zip")},
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["data"]["restored"] is True
-
-    # The post-backup marker should be gone (DB was overwritten by the backup,
-    # which predates it). Read directly via sqlite3 to bypass any pool/page
-    # caching that might linger in the SQLAlchemy engine.
-    import sqlite3 as _sqlite3
-    _con = _sqlite3.connect("data/face_attendance.db")
     try:
-        gone = _con.execute(
-            "SELECT 1 FROM system_settings WHERE key = ?", ("__restore_marker2__",)
-        ).fetchone()
-        assert gone is None, f"post-restore marker should be gone, found row: {gone}"
-    finally:
-        _con.close()
-        # Clean up the BEFORE marker.
-        before = db.execute(
-            SystemSetting.__table__.select().where(SystemSetting.key == "__restore_marker__")
-        ).first()
-        if before:
-            db.execute(SystemSetting.__table__.delete().where(SystemSetting.key == "__restore_marker__"))
+        with SessionLocal() as db:
+            db.add(SystemSetting(key="__restore_marker__", value="BEFORE"))
             db.commit()
+
+        create = client.post("/api/v1/backup", headers=admin_headers, json={"kind": "database"})
+        bid = create.json()["data"]["id"]
+
+        # Add the marker AFTER the backup so the backup doesn't contain it.
+        with SessionLocal() as db:
+            db.add(SystemSetting(key="__restore_marker2__", value="AFTER"))
+            db.commit()
+
+        dl = client.get(f"/api/v1/backup/{bid}", headers=admin_headers)
+
+        r = client.post(
+            "/api/v1/backup/restore?confirm=true",
+            headers=admin_headers,
+            files={"file": ("b.zip", io.BytesIO(dl.content), "application/zip")},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["data"]["restored"] is True
+
+        # The post-backup marker should be gone (DB was overwritten by the
+        # backup, which predates it). Read directly via sqlite3 to bypass
+        # any pool/page caching that might linger in the SQLAlchemy engine.
+        import sqlite3 as _sqlite3
+        _con = _sqlite3.connect("data/face_attendance.db")
+        try:
+            gone = _con.execute(
+                "SELECT 1 FROM system_settings WHERE key = ?", ("__restore_marker2__",)
+            ).fetchone()
+            assert gone is None, f"post-restore marker should be gone, found row: {gone}"
+        finally:
+            _con.close()
+    finally:
+        # Clean up the BEFORE marker so the test is idempotent across runs.
+        from app.db import SessionLocal as _SL
+        with _SL() as _db:
+            _db.execute(
+                SystemSetting.__table__.delete().where(
+                    SystemSetting.key.in_(("__restore_marker__", "__restore_marker2__"))
+                )
+            )
+            _db.commit()
 
 
 def test_restore_invalid_zip_rejected(client, admin_headers):

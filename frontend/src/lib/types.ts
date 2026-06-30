@@ -147,6 +147,14 @@ export interface CaptureOut {
   image_path: string;
 }
 
+export interface CaptureSummary {
+  step: number;
+  quality: number;
+  yaw: number | null;
+  pitch: number | null;
+  image_path: string;
+}
+
 export interface EnrollmentStatus {
   is_enrolled: boolean;
   enrolled_at: string | null;
@@ -222,4 +230,85 @@ export interface SettingUpdateResult {
   key: string;
   ok: boolean;
   error: string;
+}
+
+// --- Time (§3.1.10, §3.1.11) -------------------------------------------
+export interface TimeInfo {
+  /** ISO-8601 UTC timestamp of the server's clock at response time. */
+  server_now_utc: string;
+  /** Configured IANA timezone, e.g. "UTC", "Asia/Kolkata". */
+  timezone: string;
+  /** Configured NTP server hostname / IPv4. */
+  ntp_server: string;
+  /** Server process uptime in seconds. */
+  uptime_seconds: number;
+}
+
+export interface TimeUpdate {
+  timezone: string;
+  ntp_server: string;
+}
+
+export interface NtpResult {
+  server_now_utc: string;
+  ntp_server: string;
+  /** Signed clock offset in seconds (negative = server behind NTP). */
+  offset_seconds: number;
+  /** Round-trip time in milliseconds. */
+  rtt_ms: number;
+  synchronized: boolean;
+}
+
+// --- Backups (§3.10) ---------------------------------------------------
+export interface Backup {
+  id: string;
+  kind: "full" | "database";
+  filename: string;
+  size_bytes: number;
+  origin: string;
+  is_scheduled: boolean;
+  note: string | null;
+  created_at: string;
+}
+
+export interface BackupScheduleConfig {
+  enabled: boolean;
+  frequency: "daily" | "weekly";
+  /** HH:MM local time. */
+  time: string;
+  max_scheduled: number;
+}
+
+export interface RestoreResult {
+  restored: boolean;
+  kind: string;
+  filename: string | null;
+  error: string | null;
+}
+
+// --- System logs (§3.12) ----------------------------------------------
+export type LogSeverity = "debug" | "info" | "warning" | "error" | "critical";
+
+export interface SystemLogRow {
+  id: string;
+  severity: LogSeverity;
+  event: string;
+  message: string;
+  context_json: string | null;
+  created_at: string;
+}
+
+export interface SystemLogsParams {
+  severity?: LogSeverity;
+  event?: string;
+  date_from?: string;
+  date_to?: string;
+  page?: number;
+  limit?: number;
+}
+
+// --- Monitoring (§3.11) ------------------------------------------------
+export interface MonitoringStatus {
+  disk_job_next: string | null;
+  retention_job_next: string | null;
 }

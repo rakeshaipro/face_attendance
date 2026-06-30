@@ -12,7 +12,6 @@ import { Reports } from "./pages/Reports";
 import { Sync } from "./pages/Sync";
 import { Webhooks } from "./pages/Webhooks";
 import { System } from "./pages/System";
-import { ComingSoon } from "./components/shared";
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { apiKey } = useAuth();

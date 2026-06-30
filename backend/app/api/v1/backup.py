@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_admin, require_readonly
 from app.config import BACKUP_DIR
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import ApiKey
 from app.schemas.backup import (
     BackupCreate,
@@ -94,10 +94,27 @@ async def restore_backup(
 
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
-    write_system_log(db, event="backup.restore", message=f"Restored {kind} backup: {msg}")
-    write_audit(db, action="backup.restore", source="api", actor=api_key.label,
-                new_value={"kind": kind}, commit=True)
-    return Envelope(data=RestoreResult(restored=True, kind=kind or "unknown", filename=None))
+
+    # NB: do NOT reuse the request-scoped `db` here — restore_backup disposed
+    # the engine, which invalidates this session's pooled connection. Open a
+    # fresh session for the post-restore log writes (mirrors frame_source.py).
+    actor = api_key.label if api_key else "api"
+    with SessionLocal() as log_db:
+        write_system_log(
+            log_db,
+            event="backup.restore",
+            message=f"Restored {kind} backup: {msg}",
+            context={"filename": file.filename, "kind": kind},
+        )
+        write_audit(
+            log_db,
+            action="backup.restore",
+            source="api",
+            actor=actor,
+            new_value={"kind": kind, "filename": file.filename},
+            commit=True,
+        )
+    return Envelope(data=RestoreResult(restored=True, kind=kind or "unknown", filename=file.filename))
 
 
 # --- §3.10.5 download --------------------------------------------------

@@ -5,7 +5,10 @@ from __future__ import annotations
 def test_device_requires_api_key(client):
     r = client.get("/api/v1/device")
     assert r.status_code == 401
-    assert r.json()["detail"]
+    # §4.3 envelope: HTTPException is normalised into {success, data, error}.
+    body = r.json()
+    assert body["success"] is False
+    assert body["error"]
 
 
 def test_device_rejects_invalid_key(client):

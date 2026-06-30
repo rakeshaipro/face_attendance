@@ -18,7 +18,7 @@ from app.config import ENROLLMENT_DIR
 from app.core.settings_store import get_float
 from app.engine.face_provider import FaceProvider
 from app.engine.matcher import cosine_similarity
-from app.engine.pose import MANDATORY_STEP_COUNT, POSE_STEPS, assess_quality, get_step, pose_in_range
+from app.engine.pose import MANDATORY_STEP_COUNT, POSE_STEPS, POSE_TOLERANCE_DEG, assess_quality, get_step, pose_in_range
 from app.models import Employee, FaceEmbedding
 from app.schemas.enrollment import (
     CaptureOut,
@@ -60,6 +60,20 @@ def _quality_to_out(qr) -> QualityOut:  # type: ignore[no-untyped-def]
     )
 
 
+def _pose_out_of_range_msg(step: int, yaw: float | None, pitch: float | None) -> str:
+    """Human-readable reason naming the measured angles and the target window,
+    so the user knows exactly which way to move their head."""
+    spec = get_step(step)
+    parts: list[str] = []
+    if spec.yaw is not None:
+        y = "unknown" if yaw is None else f"{yaw:.0f}°"
+        parts.append(f"yaw {y} (need {spec.yaw[0]}° to {spec.yaw[1]}°)")
+    if spec.pitch is not None:
+        p = "unknown" if pitch is None else f"{pitch:.0f}°"
+        parts.append(f"pitch {p} (need {spec.pitch[0]}° to {spec.pitch[1]}°)")
+    return "Face pose not in target range — " + "; ".join(parts) + "."
+
+
 def _step_summary(emb: FaceEmbedding) -> CaptureSummary:
     return CaptureSummary(
         step=emb.pose_step,
@@ -93,9 +107,9 @@ def pose_check(frame: np.ndarray, step: int, provider: FaceProvider, *, min_face
         return PoseCheckResult(face_detected=True, face_count=len(detections), in_range=False, reason="Multiple faces detected; only one allowed.")
     det = detections[0]
     yaw, pitch = det.yaw, det.pitch
-    in_range = pose_in_range(step, yaw, pitch)
+    in_range = pose_in_range(step, yaw, pitch, tolerance=POSE_TOLERANCE_DEG)
     qr = assess_quality(frame, det.bbox, min_face_ratio=min_face_ratio)
-    reason = None if in_range else "Face pose not in target range for this step."
+    reason = None if in_range else _pose_out_of_range_msg(step, yaw, pitch)
     return PoseCheckResult(
         face_detected=True,
         face_count=1,
@@ -127,8 +141,8 @@ def capture(
     det = detections[0]
     if det.embedding is None:
         raise ValueError("Provider returned no embedding.")
-    if not pose_in_range(step, det.yaw, det.pitch):
-        raise ValueError("Face pose not in target range for this step.")
+    if not pose_in_range(step, det.yaw, det.pitch, tolerance=POSE_TOLERANCE_DEG):
+        raise ValueError(_pose_out_of_range_msg(step, det.yaw, det.pitch))
     qr = assess_quality(frame, det.bbox, min_face_ratio=min_face_ratio)
     if qr.score < quality_threshold:
         raise ValueError(f"Quality {qr.score} below threshold {quality_threshold}.")
@@ -266,6 +280,53 @@ def remove_face(db: Session, employee: Employee, api_key_label: str | None) -> N
         source="api",
         actor=api_key_label,
         note="All face embeddings and images removed.",
+        commit=True,
+    )
+
+
+def remove_step(
+    db: Session,
+    employee: Employee,
+    step: int,
+    api_key_label: str | None,
+) -> None:
+    """Delete a single pose step's embedding + image so it can be re-captured.
+
+    Removing one step invalidates any finalized enrollment (the captured set no
+    longer matches the finalized protocol), so enrollment status is reset and
+    the employee must re-finalize after re-capturing.
+    """
+    get_step(step)  # raises ValueError for out-of-range steps
+    from app.engine.service import service
+    from app.services.audit import write_audit
+
+    row = db.execute(
+        select(FaceEmbedding).where(
+            FaceEmbedding.employee_id == employee.id, FaceEmbedding.pose_step == step
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        try:
+            (ENROLLMENT_DIR / row.image_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        db.delete(row)
+
+    # A finalized enrollment is no longer valid with a missing step.
+    if employee.is_enrolled:
+        employee.is_enrolled = False
+        employee.enrolled_at = None
+        employee.enrollment_quality = None
+    db.commit()
+    service.invalidate_gallery()
+    write_audit(
+        db,
+        action="enrollment.remove_step",
+        affected_id=employee.id,
+        source="api",
+        actor=api_key_label,
+        new_value={"step": step},
+        note=f"Capture for pose step {step} removed; ready for re-capture.",
         commit=True,
     )
 

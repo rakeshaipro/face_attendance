@@ -58,19 +58,20 @@ def _have_insightface() -> bool:
 def parse_insightface_pose(pose) -> tuple[float | None, float | None, float | None]:
     """Map InsightFace's raw `face.pose` to this project's (yaw, pitch, roll).
 
-    InsightFace stores pose as ``[pitch, yaw, roll]`` in degrees, with sign
-    conventions opposite to this project's (SRS §3.3.5):
-      - turn LEFT  → negative yaw   (InsightFace reports positive)
-      - tilt  UP   → positive pitch (InsightFace reports negative)
-    Negating yaw and pitch keeps the backend aligned with the frontend
-    (MediaPipe) and the protocol ranges, e.g. step 2 (turn left) targets
-    ``yaw ∈ [-45, -30]``. Without this, step 2 and steps 4/5 always fail
-    with "Face pose not in target range".
+    InsightFace stores pose as ``[pitch, yaw, roll]`` in degrees. Its yaw
+    sign is opposite to this project's convention (SRS §3.3.5):
+      - turn LEFT  → negative yaw (InsightFace reports positive)
+      - tilt  UP   → positive pitch (already matches; InsightFace reports positive)
+    Negating yaw only keeps the backend aligned with the frontend (MediaPipe)
+    and the protocol ranges, e.g. step 2 (turn left) targets
+    ``yaw ∈ [-45, -30]`` and step 4 (tilt up) targets ``pitch ∈ [20, 35]``.
+    Negating pitch as well makes step 4/5 always fail with "Face pose not in
+    target range".
     """
     if pose is None or len(pose) < 3:
         return None, None, None
     yaw = -float(pose[1])
-    pitch = -float(pose[0])
+    pitch = float(pose[0])
     roll = float(pose[2])
     return yaw, pitch, roll
 

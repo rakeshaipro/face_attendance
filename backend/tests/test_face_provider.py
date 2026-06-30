@@ -13,12 +13,12 @@ from app.engine.pose import pose_in_range
 
 
 def test_parses_pitch_yaw_roll_order():
-    # InsightFace pose = [pitch, yaw, roll].
+    # InsightFace pose = [pitch, yaw, roll]. Pitch passes through unchanged
+    # (its sign already matches the protocol); yaw is negated.
     yaw, pitch, roll = parse_insightface_pose([5.0, -10.0, 2.0])
-    assert roll == 2.0
-    # Values are pulled from the right slots, then sign-flipped.
-    assert yaw == 10.0      # was pose[1] = -10
-    assert pitch == -5.0    # was pose[0] = 5
+    assert pitch == 5.0    # pose[0] unchanged
+    assert yaw == 10.0     # pose[1] negated
+    assert roll == 2.0     # pose[2] unchanged
 
 
 def test_left_turn_lands_in_step2_range():
@@ -30,11 +30,15 @@ def test_left_turn_lands_in_step2_range():
 
 
 def test_tilt_up_lands_in_step4_range():
-    # Tilting up reports negative pitch in InsightFace's convention.
-    # After parsing it must be positive to satisfy step 4 (pitch in [20,35]).
-    _yaw, pitch, _roll = parse_insightface_pose([-28.0, 0.0, 0.0])
+    # Tilting up reports positive pitch in InsightFace's convention, which
+    # already matches the protocol (step 4 pitch in [20,35]); it is NOT
+    # negated. Passing a negative raw pitch (tilt down) must NOT satisfy step 4.
+    _yaw, pitch, _roll = parse_insightface_pose([28.0, 0.0, 0.0])
     assert 20 <= pitch <= 35
     assert pose_in_range(4, 0.0, pitch)
+
+    _yaw, pitch_down, _roll = parse_insightface_pose([-28.0, 0.0, 0.0])
+    assert not pose_in_range(4, 0.0, pitch_down)
 
 
 def test_handles_missing_or_short_pose():

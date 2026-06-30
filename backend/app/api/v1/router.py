@@ -13,13 +13,14 @@ from app.api.v1 import (
     employees,
     enrollment,
     health,
+    monitoring,
     reports,
     settings as settings_api,
     sync,
     system_logs,
+    time,
     webhooks,
 )
-from app.api.v1.stubs import _stub
 from app.config import settings
 
 api_router = APIRouter(prefix=settings.api_prefix)
@@ -35,6 +36,8 @@ api_router.include_router(reports.router, tags=["reports"])
 api_router.include_router(settings_api.router, tags=["settings"])
 api_router.include_router(backup.router, tags=["backup"])
 api_router.include_router(system_logs.router, tags=["system_logs"])
+api_router.include_router(time.router, tags=["time"])
+api_router.include_router(monitoring.router, tags=["monitoring"])
 
 # No remaining stubs — every /api/v1 group from §4.6 is implemented.
 

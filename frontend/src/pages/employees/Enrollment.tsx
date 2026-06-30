@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useCapture, useEnrollmentProtocol, useEnrollmentStatus, useFinalizeEnrollment, useReEnroll, useRemoveFace, useVerify, useCapturesSummary } from "@/lib/queries";
+import { useCapture, useEnrollmentProtocol, useEnrollmentStatus, useFinalizeEnrollment, useReEnroll, useRemoveCapture, useVerify, useCapturesSummary } from "@/lib/queries";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
 import { poseInRange } from "@/lib/poseCheck";
 import type { PoseStep } from "@/lib/types";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Spinner } from "@/components/ui";
 import { ErrorBanner } from "@/components/shared";
 import { FacePoseGuide } from "@/components/FacePoseGuide";
-import { Camera, CheckCircle2, ChevronDown, ChevronUp, RotateCcw, Trash2 } from "lucide-react";
+import { Camera, CheckCircle2, ChevronDown, ChevronUp, Focus, Lightbulb, Maximize2, RotateCcw, ScanFace, Sun, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface EnrollmentProps {
@@ -94,23 +94,38 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
   const capture   = useCapture(employeeId);
   const finalize  = useFinalizeEnrollment(employeeId);
   const reEnroll  = useReEnroll(employeeId);
-  const removeFace = useRemoveFace(employeeId);
+  const removeCapture = useRemoveCapture(employeeId);
   const verify    = useVerify(employeeId);
 
   const capturesMap = new Map<number, string>();
+  const capturesQuality = new Map<number, number>();
   if (capturesSummary.data) {
     for (const c of capturesSummary.data) {
       capturesMap.set(c.step, c.image_path);
+      capturesQuality.set(c.step, c.quality);
     }
   }
 
+  // Cache-buster: the backend reuses the same filename when a pose is
+  // re-captured ({employee}_{step}.jpg overwrites in place), so an identical
+  // URL would serve the browser's stale thumbnail. `dataUpdatedAt` changes on
+  // every successful refetch (capture and remove both invalidate this query),
+  // forcing a fresh image fetch.
+  const captureImgVersion = capturesSummary.dataUpdatedAt ?? 0;
+  const captureImg = (path: string) => `/media/enrollment/${path}?v=${captureImgVersion}`;
+
   const [currentStep, setCurrentStep] = useState(1);
+  // Drives auto-advance: set only when a capture succeeds, cleared on manual
+  // navigation or after the advance fires. Prevents jumping away from a
+  // captured step the user clicked to review/remove.
+  const [justCapturedStep, setJustCapturedStep] = useState<number | null>(null);
   const [live, setLive]               = useState<{ yaw: number | null; pitch: number | null; inRange: boolean; quality: number | null } | null>(null);
   const [camError, setCamError]       = useState<string | null>(null);
   const [finalResult, setFinalResult] = useState<{ overall: number; warning: string | null } | null>(null);
   const [verifyScore, setVerifyScore] = useState<number | null>(null);
   const [active, setActive]           = useState(false);
   const [showDetails, setShowDetails] = useState(false);
+  const [tipsOpen, setTipsOpen]       = useState(true);
 
   const steps = protocol?.steps ?? [];
   const step: PoseStep | undefined = steps.find((s) => s.step === currentStep);
@@ -165,7 +180,10 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
     captureLockRef.current = true;
     capture.mutate(
       { step: currentStep, file: blob },
-      { onSettled: () => { captureLockRef.current = false; } }
+      {
+        onSuccess: () => setJustCapturedStep(currentStep),
+        onSettled: () => { captureLockRef.current = false; },
+      }
     );
   }, [capture, currentStep]);
 
@@ -272,13 +290,16 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, currentStep, detect]);
 
-  // Auto-advance once a step is captured.
+  // Auto-advance ONLY right after the current step was just captured (not when
+  // the user navigates back to an already-captured step to review/remove it).
   useEffect(() => {
-    if (captured.has(currentStep) && currentStep < 7) {
-      const t = setTimeout(() => setCurrentStep((s) => Math.min(7, s + 1)), 600);
-      return () => clearTimeout(t);
-    }
-  }, [captured, currentStep]);
+    if (justCapturedStep == null || justCapturedStep !== currentStep || currentStep >= 7) return;
+    const t = setTimeout(() => {
+      setCurrentStep((s) => Math.min(7, s + 1));
+      setJustCapturedStep(null);
+    }, 600);
+    return () => clearTimeout(t);
+  }, [justCapturedStep, currentStep]);
 
   const onFinalize = async () => {
     try {
@@ -313,17 +334,21 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
     setCurrentStep(1);
   };
 
-  const onRemove = async () => {
-    if (!confirm("Remove all face data for this employee?")) return;
-    await removeFace.mutateAsync();
+  const onRemovePose = async () => {
+    if (!captured.has(currentStep)) return;
+    if (!confirm(`Remove the captured photo for pose ${currentStep}? You can re-capture it.`)) return;
+    await removeCapture.mutateAsync(currentStep);
     setFinalResult(null);
-    setCurrentStep(1);
   };
 
   // ── Derived UI flags ────────────────────────────────────────────────────────
   const faceDetected = live !== null && live.yaw !== null;
   const inRange      = live?.inRange ?? false;
   const blinkReady   = faceDetected && inRange && !captured.has(currentStep) && !captureLockRef.current;
+
+  // Per-pose quality for the step currently in focus (for inline guidance).
+  const currentStepQuality = step ? capturesQuality.get(step.step) : undefined;
+  const currentStepTier    = currentStepQuality != null ? qualityTier(currentStepQuality) : null;
 
   /** Manual one-shot capture — fires immediately from the current canvas frame. */
   const onManualCapture = async () => {
@@ -334,7 +359,10 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
     captureLockRef.current = true;
     capture.mutate(
       { step: currentStep, file: blob },
-      { onSettled: () => { captureLockRef.current = false; } }
+      {
+        onSuccess: () => setJustCapturedStep(currentStep),
+        onSettled: () => { captureLockRef.current = false; },
+      }
     );
   };
 
@@ -355,48 +383,89 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
         {camError && <ErrorBanner message={camError} />}
         {landmarkerError && <ErrorBanner message={`Detector initialization failed: ${landmarkerError}`} />}
 
+        {/* ── Tips for best capture quality (guideline) ── */}
+        <div className="rounded-md border bg-muted/30">
+          <button
+            type="button"
+            onClick={() => setTipsOpen((v) => !v)}
+            className="flex w-full items-center justify-between gap-2 p-3 text-left"
+          >
+            <span className="flex items-center gap-2 text-sm font-medium">
+              <Lightbulb className="h-4 w-4 text-amber-500" />
+              Tips for best capture quality
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {tipsOpen ? "Hide" : "Show"}
+              {tipsOpen ? <ChevronUp className="ml-1 inline h-3.5 w-3.5" /> : <ChevronDown className="ml-1 inline h-3.5 w-3.5" />}
+            </span>
+          </button>
+          {tipsOpen && (
+            <div className="grid gap-3 border-t p-3 sm:grid-cols-2">
+              <Tip icon={<Focus className="h-4 w-4 text-blue-500" />} title="Hold still" weight="45%">
+                Motion blur lowers quality the most — freeze for a moment when the capture fires (a blink or the button).
+              </Tip>
+              <Tip icon={<Maximize2 className="h-4 w-4 text-indigo-500" />} title="Fill the oval" weight="35%">
+                Sit about an arm's length (50–70&nbsp;cm) away and let your face fill the on-screen oval. Too far = face too small.
+              </Tip>
+              <Tip icon={<Sun className="h-4 w-4 text-amber-500" />} title="Face the light" weight="20%">
+                Face a window or lamp. Avoid backlight (light behind you) and very dim or harsh direct glare.
+              </Tip>
+              <Tip icon={<ScanFace className="h-4 w-4 text-emerald-500" />} title="Clear your face">
+                Remove sunglasses, masks, or hair covering your face. Capture only when the oval ring is green.
+              </Tip>
+            </div>
+          )}
+        </div>
+
         {/* Step indicators */}
         <div className="flex items-center justify-center gap-2">
-          {steps.map((s) => (
+          {steps.map((s) => {
+            const sq = capturesQuality.get(s.step);
+            const tier = sq != null ? qualityTier(sq) : null;
+            return (
             <div key={s.step} className="group relative">
               <button
-                onClick={() => setCurrentStep(s.step)}
+                onClick={() => { setJustCapturedStep(null); setCurrentStep(s.step); }}
                 className={cn(
                   "flex h-10 w-10 items-center justify-center rounded-full border text-sm font-medium transition-all duration-200 overflow-hidden",
                   captured.has(s.step)
-                    ? "border-emerald-500 hover:border-emerald-600 shadow-sm"
+                    ? cn(tier?.border ?? "border-emerald-500", "shadow-sm hover:opacity-80")
                     : currentStep === s.step
                       ? "border-primary bg-primary/10 text-primary ring-2 ring-primary/20"
                       : "border-border text-muted-foreground hover:border-muted-foreground/60",
                 )}
                 title={s.instruction}
               >
-                {captured.has(s.step) && capturesMap.has(s.step) ? (
+                {capture.isPending && s.step === currentStep ? (
+                  <Spinner className="h-5 w-5" />
+                ) : captured.has(s.step) && capturesMap.has(s.step) ? (
                   <img
-                    src={`/media/enrollment/${capturesMap.get(s.step)}`}
+                    src={captureImg(capturesMap.get(s.step)!)}
                     alt={`Step ${s.step}`}
                     className="h-full w-full object-cover"
                   />
                 ) : captured.has(s.step) ? (
-                  <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                  <CheckCircle2 className={cn("h-4 w-4", tier?.text ?? "text-emerald-500")} />
                 ) : (
                   s.step
                 )}
               </button>
               {captured.has(s.step) && capturesMap.has(s.step) && (
-                <div className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 w-28 -translate-x-1/2 scale-95 rounded-lg border bg-popover p-1 shadow-md opacity-0 group-hover:opacity-100 group-hover:scale-100 transition-all duration-200">
+                <div className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 w-32 -translate-x-1/2 scale-95 rounded-lg border bg-popover p-1 shadow-md opacity-0 group-hover:opacity-100 group-hover:scale-100 transition-all duration-200">
                   <img
-                    src={`/media/enrollment/${capturesMap.get(s.step)}`}
+                    src={captureImg(capturesMap.get(s.step)!)}
                     alt={`Preview Step ${s.step}`}
                     className="aspect-square w-full rounded-md object-cover"
                   />
-                  <div className="mt-1 text-[10px] text-center font-medium text-popover-foreground">
-                    Step {s.step} captured
+                  <div className={cn("mt-1 flex items-center justify-center gap-1 text-[10px] text-center font-medium", tier?.text ?? "text-popover-foreground")}>
+                    <span className={cn("h-1.5 w-1.5 rounded-full", tier?.dot ?? "bg-emerald-500")} />
+                    Step {s.step}{tier ? ` · ${tier.label}` : ""}{sq != null ? ` (${sq.toFixed(2)})` : ""}
                   </div>
                 </div>
               )}
             </div>
-          ))}
+            );
+          })}
         </div>
 
         {/* ── Video + overlays ── */}
@@ -577,6 +646,32 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
             </button>
           )}
 
+          {/* ── Upload-in-flight overlay (waiting sign while image uploads) ── */}
+          {capture.isPending && (
+            <div
+              className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-black/60 text-white"
+              style={{ pointerEvents: "none" }}
+            >
+              <Spinner className="h-8 w-8 text-primary" />
+              <span className="text-sm font-medium tracking-wide">Uploading capture…</span>
+            </div>
+          )}
+
+          {/* ── Capture-failed overlay (shows the real backend error message) ── */}
+          {capture.isError && !capture.isPending && (
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/80 p-6 text-center text-white">
+              <span className="text-sm font-semibold" style={{ color: "#fca5a5" }}>
+                Capture failed
+              </span>
+              <span className="max-w-md text-sm text-white/90">
+                {(capture.error as Error)?.message || "Could not capture this pose. Please try again."}
+              </span>
+              <Button size="sm" variant="outline" onClick={() => capture.reset()}>
+                Dismiss
+              </Button>
+            </div>
+          )}
+
           {/* ── Corner directional guide (mirrored-aware) ── */}
           {active && step && (
             <FacePoseGuide
@@ -622,6 +717,17 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
                 {showDetails ? "Hide" : "Details"}
               </button>
             </div>
+            {currentStepTier && currentStepQuality != null && (
+              <div className="mt-3 flex items-start gap-2 rounded-md bg-muted/40 p-2">
+                <span className={cn("mt-1 h-2 w-2 shrink-0 rounded-full", currentStepTier.dot)} />
+                <div className="text-xs">
+                  <span className={cn("font-medium", currentStepTier.text)}>
+                    Captured quality {currentStepQuality.toFixed(2)} · {currentStepTier.label}
+                  </span>
+                  <span className="ml-1 text-muted-foreground">{currentStepTier.suggestion}</span>
+                </div>
+              </div>
+            )}
             {showDetails && (
               <div className="mt-3 flex flex-wrap gap-4 text-sm">
                 <Readout label="Yaw"     value={live?.yaw   != null ? `${live.yaw.toFixed(0)}°`   : "—"} />
@@ -674,19 +780,39 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
             <Button size="sm" variant="ghost" onClick={onReEnroll} className="gap-2">
               <RotateCcw className="h-4 w-4" /> Re-enroll
             </Button>
-            <Button size="sm" variant="ghost" onClick={onRemove} className="gap-2">
-              <Trash2 className="h-4 w-4 text-destructive" /> Remove
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onRemovePose}
+              disabled={!captured.has(currentStep) || removeCapture.isPending}
+              className="gap-2"
+              title={captured.has(currentStep) ? `Remove captured photo for pose ${currentStep}` : "No captured photo for the current pose"}
+            >
+              <Trash2 className="h-4 w-4 text-destructive" />
+              {removeCapture.isPending ? <Spinner className="h-4 w-4" /> : "Remove pose"}
             </Button>
           </div>
         </div>
 
-        {finalResult && (
-          <div className="rounded-md border p-4">
-            <p className="font-medium">Enrollment finalized</p>
-            <p className="text-sm text-muted-foreground">Overall quality: {finalResult.overall.toFixed(3)}</p>
-            {finalResult.warning && <ErrorBanner message={finalResult.warning} className="mt-2" />}
-          </div>
-        )}
+        {finalResult && (() => {
+          const verdict = finalizeVerdict(finalResult.overall);
+          return (
+            <div className="rounded-md border p-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="font-medium">Enrollment finalized</p>
+                <span className={cn("text-sm font-semibold", verdict.text)}>
+                  {verdict.label}
+                </span>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                Overall quality: <span className={cn("font-semibold", verdict.text)}>{finalResult.overall.toFixed(3)}</span>
+                <span className="ml-1 text-muted-foreground">(min recommended 0.40)</span>
+              </p>
+              <p className={cn("mt-1 text-xs", verdict.text)}>{verdict.tip}</p>
+              {finalResult.warning && <ErrorBanner message={finalResult.warning} className="mt-2" />}
+            </div>
+          );
+        })()}
 
         {verifyScore != null && (
           <div className="rounded-md border p-4 text-sm">
@@ -694,9 +820,9 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
           </div>
         )}
 
-        {(capture.isError || finalize.isError) && (
+        {(finalize.isError || removeCapture.isError) && (
           <ErrorBanner
-            message={(capture.error as Error)?.message || (finalize.error as Error)?.message || "Enrollment error."}
+            message={(finalize.error as Error)?.message || (removeCapture.error as Error)?.message || "Enrollment error."}
           />
         )}
       </CardContent>
@@ -711,4 +837,73 @@ function Readout({ label, value }: { label: string; value: React.ReactNode }) {
       <span className="font-medium">{value}</span>
     </div>
   );
+}
+
+function Tip({ icon, title, weight, children }: { icon: React.ReactNode; title: string; weight?: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-2">
+      <span className="mt-0.5 shrink-0">{icon}</span>
+      <div className="text-xs">
+        <p className="font-medium text-foreground">
+          {title}{weight && <span className="ml-1 font-normal text-muted-foreground">· {weight} of score</span>}
+        </p>
+        <p className="mt-0.5 text-muted-foreground">{children}</p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Quality guidance ────────────────────────────────────────────────────────
+// Per-capture quality = 0.45·sharpness + 0.20·brightness + 0.35·face_size.
+// Tiers map a score to a colour + actionable suggestion. The full Tailwind
+// class names appear literally below so the JIT compiler includes them.
+
+interface QualityTier {
+  label: string;
+  tone: "good" | "ok" | "low";
+  border: string;     // captured-step circle border
+  text: string;       // inline accent text
+  dot: string;        // small status dot bg
+  suggestion: string; // targeted tip
+}
+
+function qualityTier(score: number): QualityTier {
+  if (score >= 0.6) {
+    return {
+      label: "Good", tone: "good",
+      border: "border-emerald-500", text: "text-emerald-600", dot: "bg-emerald-500",
+      suggestion: "Good quality — no change needed.",
+    };
+  }
+  if (score >= 0.4) {
+    return {
+      label: "Acceptable", tone: "ok",
+      border: "border-amber-500", text: "text-amber-600", dot: "bg-amber-500",
+      suggestion: "Could be sharper — hold still, fill the oval, and face a light source.",
+    };
+  }
+  return {
+    label: "Low", tone: "low",
+    border: "border-red-500", text: "text-red-600", dot: "bg-red-500",
+    suggestion: "Re-capture this pose: fill the oval with your face, hold steady, and improve the lighting.",
+  };
+}
+
+interface FinalizeVerdict {
+  label: string;
+  text: string;
+  tip: string;
+}
+
+function finalizeVerdict(score: number): FinalizeVerdict {
+  if (score >= 0.7) {
+    return { label: "Excellent", text: "text-emerald-600", tip: "High-quality enrollment — recognition will be reliable." };
+  }
+  if (score >= 0.55) {
+    return { label: "Good", text: "text-emerald-600", tip: "Solid quality. For even better matching, fill the oval and hold still on each capture." };
+  }
+  if (score >= 0.4) {
+    return { label: "Acceptable", text: "text-amber-600", tip: "Workable, but re-enrolling with better lighting, focus, and a larger face would improve recognition." };
+  }
+  return { label: "Below recommended", text: "text-red-600", tip: "Below the recommended minimum. Re-enroll: fill the oval, hold steady, and face a light source." };
 }

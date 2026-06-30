@@ -37,6 +37,15 @@ POSE_STEPS: list[PoseStep] = [
 
 MANDATORY_STEP_COUNT = sum(1 for s in POSE_STEPS if s.mandatory)  # = 5
 
+# Margin (degrees) added to each axis window when validating a capture. The
+# client's "in range" indicator is driven by MediaPipe while the backend
+# validates with InsightFace; the two models measure the same face slightly
+# differently and the variance compounds for combined poses (steps 6–7, which
+# constrain both yaw and pitch). This tolerance keeps a client-"green" pose
+# reliably acceptable without weakening the protocol — the ranges published to
+# the client via /protocol stay unchanged, so the client stays conservative.
+POSE_TOLERANCE_DEG = 5.0
+
 
 def get_step(step: int) -> PoseStep:
     for s in POSE_STEPS:
@@ -45,14 +54,19 @@ def get_step(step: int) -> PoseStep:
     raise ValueError(f"Unknown pose step {step}. Valid range: 1–7.")
 
 
-def pose_in_range(step: int, yaw: float | None, pitch: float | None) -> bool:
-    """True when (yaw, pitch) fall within the target window for `step`."""
+def pose_in_range(step: int, yaw: float | None, pitch: float | None, *, tolerance: float = 0.0) -> bool:
+    """True when (yaw, pitch) fall within the target window for `step`.
+
+    ``tolerance`` expands each axis window by that many degrees on both sides
+    (default 0 = strict, used by direct callers/tests). capture/pose-check pass
+    ``POSE_TOLERANCE_DEG`` to absorb client↔backend model variance.
+    """
     spec = get_step(step)
     if spec.yaw is not None:
-        if yaw is None or not (spec.yaw[0] <= yaw <= spec.yaw[1]):
+        if yaw is None or not (spec.yaw[0] - tolerance <= yaw <= spec.yaw[1] + tolerance):
             return False
     if spec.pitch is not None:
-        if pitch is None or not (spec.pitch[0] <= pitch <= spec.pitch[1]):
+        if pitch is None or not (spec.pitch[0] - tolerance <= pitch <= spec.pitch[1] + tolerance):
             return False
     return True
 
