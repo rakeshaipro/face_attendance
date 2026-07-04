@@ -32,7 +32,7 @@ def test_create_full_backup_includes_images(client, admin_headers):
     assert dl.headers["content-type"] == "application/zip"
     zf = zipfile.ZipFile(io.BytesIO(dl.content))
     names = zf.namelist()
-    assert "face_attendance.db" in names
+    assert "face_attendance.sql" in names
     assert any(n.startswith("snapshots/") for n in names)
 
     # cleanup
@@ -95,17 +95,13 @@ def test_restore_valid_zip_overwrites_db(client, admin_headers):
         assert r.json()["data"]["restored"] is True
 
         # The post-backup marker should be gone (DB was overwritten by the
-        # backup, which predates it). Read directly via sqlite3 to bypass
-        # any pool/page caching that might linger in the SQLAlchemy engine.
-        import sqlite3 as _sqlite3
-        _con = _sqlite3.connect("data/face_attendance.db")
-        try:
-            gone = _con.execute(
-                "SELECT 1 FROM system_settings WHERE key = ?", ("__restore_marker2__",)
-            ).fetchone()
+        # backup, which predates it). Verify via a fresh SessionLocal read.
+        with SessionLocal() as db:
+            from sqlalchemy import select as _sel
+            gone = db.execute(
+                _sel(SystemSetting).where(SystemSetting.key == "__restore_marker2__")
+            ).scalar_one_or_none()
             assert gone is None, f"post-restore marker should be gone, found row: {gone}"
-        finally:
-            _con.close()
     finally:
         # Clean up the BEFORE marker so the test is idempotent across runs.
         from app.db import SessionLocal as _SL

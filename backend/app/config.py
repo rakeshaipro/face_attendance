@@ -41,8 +41,9 @@ class Settings(BaseSettings):
     encryption_key: SecretStr = Field(default="")
 
     # --- Database --------------------------------------------------------
-    # SQLite by default. The SRS (§3.10, §5) specifies SQLite.
-    database_url: str = f"sqlite:///{DB_PATH.as_posix()}"
+    # PostgreSQL with pgvector (Docker). Override with FA_DATABASE_URL.
+    # Uses the psycopg v3 driver (psycopg[binary]) for scram-sha-256 auth.
+    database_url: str = "postgresql+psycopg://postgres:q1w2e3r4@localhost:5433/face_attendance"
 
     # --- Recognition engine ---------------------------------------------
     # Whether to autostart the recognition service when the app boots.
@@ -56,10 +57,6 @@ class Settings(BaseSettings):
     # Comma-separated list of allowed origins for the admin dashboard.
     # The Vite dev server (http://localhost:5173) is allowed by default.
     cors_origins: str = "http://localhost:5173"
-
-    @property
-    def sqlite_url(self) -> str:
-        return self.database_url
 
 
 settings = Settings()

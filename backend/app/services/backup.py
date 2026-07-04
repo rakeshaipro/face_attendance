@@ -1,30 +1,30 @@
 """Backup + restore logic (SRS §3.10).
 
 Backups are unencrypted ZIP archives (§3.10.3 — LAN-local, physically
-secure). Full backups include the SQLite DB + snapshots + enrollment
-images; database-only backups include just the DB.
+secure). Full backups include a pg_dump + snapshots + enrollment images;
+database-only backups include just the pg_dump.
 """
 from __future__ import annotations
 
 import logging
 import os
 import shutil
-import sqlite3
+import subprocess
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app.config import BACKUP_DIR, DB_PATH, ENROLLMENT_DIR, SNAPSHOT_DIR
+from app.config import BACKUP_DIR, ENROLLMENT_DIR, SNAPSHOT_DIR, settings
 from app.core.settings_store import get_int, get_value, set_value
 from app.models import Backup
 
 logger = logging.getLogger(__name__)
 
-DB_FILENAME = "face_attendance.db"
+DB_FILENAME = "face_attendance.sql"
 
 
 def _timestamp() -> str:
@@ -33,6 +33,24 @@ def _timestamp() -> str:
 
 def _backup_filename(kind: str) -> str:
     return f"backup_{_timestamp()}_{kind}.zip"
+
+
+def _run_pg_dump(dest: Path) -> None:
+    """Run pg_dump against the configured database URL to produce a plain SQL file."""
+    url = settings.database_url
+    # Parse postgresql://user:pass@host:port/dbname
+    # Strip the "postgresql://" or "postgresql+psycopg2://" prefix.
+    clean = url.split("://", 1)[1]
+    userpass, rest = clean.split("@", 1)
+    user, password = userpass.split(":", 1)
+    hostport, dbname = rest.rsplit("/", 1)
+    env = {**os.environ, "PGPASSWORD": password}
+    subprocess.run(
+        ["pg_dump", "--host", hostport.split(":")[0], "--port", hostport.split(":")[1],
+         "--username", user, "--dbname", dbname, "--format=plain",
+         "--no-owner", "--no-privileges", "--file", str(dest)],
+        check=True, env=env, capture_output=True,
+    )
 
 
 def _add_dir_to_zip(zf: zipfile.ZipFile, src: Path, arcname: str) -> int:
@@ -50,7 +68,7 @@ def _add_dir_to_zip(zf: zipfile.ZipFile, src: Path, arcname: str) -> int:
 def create_backup(db: Session, *, kind: str, origin: str = "manual") -> Backup:
     """Create a backup ZIP and record its row.
 
-    kind: "full" (db + snapshots + enrollment) or "database" (db only).
+    kind: "full" (pg_dump + snapshots + enrollment) or "database" (dump only).
     origin: "manual" or "scheduled".
     """
     if kind not in ("full", "database"):
@@ -61,14 +79,13 @@ def create_backup(db: Session, *, kind: str, origin: str = "manual") -> Backup:
     image_count = 0
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Always include the DB. Copy to a temp file first so we don't zip a
-        # half-written WAL — checkpoint + copy gives a consistent snapshot.
-        snapshot_db = BACKUP_DIR / f".{DB_FILENAME}.tmp"
-        shutil.copy2(DB_PATH, snapshot_db)
+        # Use pg_dump for a consistent plain-text SQL backup.
+        dump_tmp = BACKUP_DIR / f".{DB_FILENAME}.tmp"
         try:
-            zf.write(snapshot_db, DB_FILENAME)
+            _run_pg_dump(dump_tmp)
+            zf.write(dump_tmp, DB_FILENAME)
         finally:
-            snapshot_db.unlink(missing_ok=True)
+            dump_tmp.unlink(missing_ok=True)
 
         if kind == "full":
             image_count += _add_dir_to_zip(zf, SNAPSHOT_DIR, Path("snapshots"))
@@ -112,78 +129,11 @@ def delete_backup(db: Session, backup_id: str) -> bool:
     return True
 
 
-def _replace_with_retry(src: Path, dst: Path, attempts: int = 8, delay: float = 0.25) -> None:
-    """os.replace that survives transient Windows file-locking from other connections."""
-    import time
-
-    last_exc: Exception | None = None
-    for _ in range(attempts):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError as exc:
-            last_exc = exc
-            time.sleep(delay)
-    raise last_exc  # type: ignore[misc]
-
-
-def _atomic_file_replace(src: Path, dst: Path, attempts: int = 20, delay: float = 0.25) -> None:
-    """Replace dst's contents with src's contents, atomically per-platform.
-
-    Tries `os.replace` first; on Windows this fails when any other process
-    (including the SQLAlchemy connection pool or the test client) holds
-    the destination open. As a fallback we truncate dst in-place and write
-    src bytes to it — SQLite tolerates this when no transactions are open
-    against the pool (we dispose the engine before calling this).
-    """
-    import time
-
-    try:
-        _replace_with_retry(src, dst)
-        return
-    except PermissionError:
-        # Fall through to the in-place replace below.
-        pass
-
-    last_exc: Exception | None = None
-    for _ in range(attempts):
-        try:
-            with open(src, "rb") as fin:
-                data = fin.read()
-            # Use wb+ on Windows: wb truncates the file, then write fresh
-            # bytes. Even if other processes hold the file in r+b mode,
-            # our truncate + write wins because the destination isn't open
-            # for reading.
-            with open(dst, "wb") as fout:
-                fout.write(data)
-                fout.flush()
-                import os as _os
-                _os.fsync(fout.fileno())
-            # SQLite WAL/SHM sidecars can hold recent writes that survive
-            # the main-file overwrite. Delete them so the restored DB is
-            # the single source of truth.
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(str(dst) + suffix)
-                if sidecar.exists():
-                    try:
-                        sidecar.unlink()
-                    except OSError:
-                        pass
-            # In-place write leaves `src` behind; unlink it so the
-            # `.restoring` temp file does not linger on disk.
-            src.unlink(missing_ok=True)
-            return
-        except PermissionError as exc:
-            last_exc = exc
-            time.sleep(delay)
-    raise last_exc  # type: ignore[misc]
-
-
 def validate_backup_zip(zip_path: Path) -> tuple[bool, str]:
     """Check that a ZIP is a valid backup from this system (§3.10.7).
 
-    Returns (ok, message). Validates: it's a ZIP, contains face_attendance.db,
-    and that DB passes SQLite integrity_check.
+    Returns (ok, message). Validates: it's a ZIP, contains the SQL dump file,
+    and that the dump is non-empty.
     """
     if not zipfile.is_zipfile(zip_path):
         return False, "File is not a ZIP archive."
@@ -191,18 +141,10 @@ def validate_backup_zip(zip_path: Path) -> tuple[bool, str]:
         names = zf.namelist()
         if DB_FILENAME not in names:
             return False, f"Backup ZIP does not contain {DB_FILENAME}."
-        # Extract the DB to a temp location and integrity-check it.
-        tmp = BACKUP_DIR / f".restore_{DB_FILENAME}.tmp"
-        try:
-            with zf.open(DB_FILENAME) as src, open(tmp, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            con = sqlite3.connect(str(tmp))
-            result = con.execute("PRAGMA integrity_check;").fetchone()
-            con.close()
-            if result[0] != "ok":
-                return False, f"Database integrity check failed: {result[0]}"
-        finally:
-            tmp.unlink(missing_ok=True)
+        # Verify the dump file is non-empty.
+        info = zf.getinfo(DB_FILENAME)
+        if info.file_size == 0:
+            return False, "Database dump file is empty."
     return True, "ok"
 
 
@@ -210,7 +152,7 @@ def restore_backup(zip_path: Path, *, confirm: bool) -> tuple[bool, str, str | N
     """Validate + restore a backup ZIP (§3.10.7).
 
     Returns (ok, message, kind). Requires confirm=True; stops the engine,
-    swaps the DB (+ images for full), restarts.
+    restores the pg_dump SQL (+ images for full), restarts.
     """
     if not confirm:
         return False, "Confirmation required (confirm=true) — current data will be overwritten.", None
@@ -224,44 +166,31 @@ def restore_backup(zip_path: Path, *, confirm: bool) -> tuple[bool, str, str | N
         names = set(zf.namelist())
         kind = "full" if any(n.startswith("snapshots/") for n in names) else "database"
 
-    # Stop the engine so it releases the DB handle.
+    # Stop the engine so it releases DB handles.
     from app.engine.service import service
     service.stop()
 
-    # Dispose the SQLAlchemy engine pool so no connections hold the DB
-    # file open (Windows file locking would otherwise refuse overwrite).
+    # Dispose the SQLAlchemy engine pool.
     from app.db import engine as db_engine
     db_engine.dispose()
 
-    # Ensure WAL is flushed to the main DB so the in-place replace
-    # (truncate + write) covers everything. Without this, recent writes
-    # linger in face_attendance.db-wal and stay visible after the replace.
     try:
-        con = sqlite3.connect(str(DB_PATH))
-        con.execute("PRAGMA wal_checkpoint(FULL);")
-        con.close()
-    except Exception:
-        logger.exception("WAL checkpoint before restore failed (non-fatal)")
-
-    try:
+        # Drop and recreate the schema, then pipe the dump into psql.
+        dump_tmp = BACKUP_DIR / f".restore_{DB_FILENAME}.tmp"
         with zipfile.ZipFile(zip_path) as zf:
-            tmp_db = DB_PATH.with_suffix(".restoring")
-            try:
-                with zf.open(DB_FILENAME) as src, open(tmp_db, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                # Replace the target DB file. Tries os.replace; on Windows
-                # if any process holds the destination, falls back to
-                # truncating and writing contents in place.
-                _atomic_file_replace(tmp_db, DB_PATH)
-                if kind == "full":
-                    _extract_tree(zf, "snapshots", SNAPSHOT_DIR)
-                    _extract_tree(zf, "enrollment", ENROLLMENT_DIR)
-            except Exception:
-                # Don't leave a stale .restoring file behind — it would
-                # confuse subsequent test runs and is never the canonical
-                # DB on disk anyway.
-                tmp_db.unlink(missing_ok=True)
-                raise
+            with zf.open(DB_FILENAME) as src, open(dump_tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+        _run_psql_restore(dump_tmp, clean=True)
+        dump_tmp.unlink(missing_ok=True)
+
+        if kind == "full":
+            with zipfile.ZipFile(zip_path) as zf:
+                _extract_tree(zf, "snapshots", SNAPSHOT_DIR)
+                _extract_tree(zf, "enrollment", ENROLLMENT_DIR)
+    except Exception as exc:
+        dump_tmp.unlink(missing_ok=True)
+        raise exc
     finally:
         # Restart the engine.
         try:
@@ -273,6 +202,33 @@ def restore_backup(zip_path: Path, *, confirm: bool) -> tuple[bool, str, str | N
             logger.exception("engine failed to restart after restore")
 
     return True, f"Restored {kind} backup; engine restarted.", kind
+
+
+def _run_psql_restore(sql_file: Path, *, clean: bool = False) -> None:
+    """Pipe a pg_dump SQL file into psql. If clean=True, drops existing tables first."""
+    url = settings.database_url
+    clean_url = url.split("://", 1)[1]
+    userpass, rest = clean_url.split("@", 1)
+    user, password = userpass.split(":", 1)
+    hostport, dbname = rest.rsplit("/", 1)
+    env = {**os.environ, "PGPASSWORD": password}
+
+    if clean:
+        # Terminate other connections and drop public schema, then recreate.
+        subprocess.run(
+            ["psql", "--host", hostport.split(":")[0], "--port", hostport.split(":")[1],
+             "--username", user, "--dbname", dbname, "-c",
+             "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"],
+            check=True, env=env, capture_output=True,
+        )
+
+    with open(sql_file, "r") as f:
+        subprocess.run(
+            ["psql", "--host", hostport.split(":")[0], "--port", hostport.split(":")[1],
+             "--username", user, "--dbname", dbname, "--set", "ON_ERROR_STOP=1",
+             "--file", str(sql_file)],
+            check=True, env=env, capture_output=True, stdin=f,
+        )
 
 
 def _extract_tree(zf: zipfile.ZipFile, arcname: str, dest: Path) -> None:

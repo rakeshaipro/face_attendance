@@ -57,11 +57,12 @@ def test_delete_admin_cascades(client, admin_headers):
 
     emp = _create(client, admin_headers, "DEL2")
     # Insert a stray embedding row to confirm cascade.
-    import json, uuid
+    import uuid
     with SessionLocal() as db:
+        _emb = [0.0] * 512
         row = FaceEmbedding(
             id=uuid.uuid4().hex, employee_id=emp["id"], pose_step=1,
-            embedding_json=json.dumps([0.0] * 512), image_path="x.jpg",
+            embedding_vec=_emb, embedding_json=str(_emb), image_path="x.jpg",
         )
         db.add(row)
         db.commit()

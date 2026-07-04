@@ -25,11 +25,10 @@ def _fresh_engine_state(monkeypatch):
 
 def _enroll_employee(db, embedding: np.ndarray, *, blocked: bool = False) -> str:
     """Insert an employee + one embedding; mark enrolled. Returns internal id."""
-    import json
-
     from app.models import Employee, FaceEmbedding
 
     eid = uuid.uuid4().hex
+    emb_list = embedding.astype(float).tolist()
     emp = Employee(
         id=eid, employee_id=f"ORG-{eid[:6]}", name=f"Emp-{eid[:4]}",
         is_active=True, is_blocked=blocked, is_enrolled=True,
@@ -38,7 +37,8 @@ def _enroll_employee(db, embedding: np.ndarray, *, blocked: bool = False) -> str
     db.add(
         FaceEmbedding(
             id=uuid.uuid4().hex, employee_id=eid, pose_step=1,
-            embedding_json=json.dumps(embedding.astype(float).tolist()),
+            embedding_vec=emb_list,
+            embedding_json=str(emb_list),
             image_path="x.jpg", quality_score=0.9,
         )
     )

@@ -1,13 +1,12 @@
 """Pytest fixtures.
 
-- Uses a file-based SQLite (FA_DATABASE_URL) on a stable path.
+- Uses PostgreSQL (FA_DATABASE_URL) with pgvector extension.
 - Seeds system_settings defaults + an admin + a readonly API key once.
 - FA_AUTOSTART_ENGINE=false so no real camera is required.
 """
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
@@ -16,10 +15,7 @@ from fastapi.testclient import TestClient
 # Configure env BEFORE importing the app.
 os.environ.setdefault("FA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
 os.environ.setdefault("FA_AUTOSTART_ENGINE", "false")
-_TMP_DB = Path(__file__).resolve().parent / "_test.db"
-os.environ["FA_DATABASE_URL"] = f"sqlite:///{_TMP_DB.as_posix()}"
-if _TMP_DB.exists():
-    _TMP_DB.unlink(missing_ok=True)
+os.environ.setdefault("FA_DATABASE_URL", "postgresql+psycopg://postgres:q1w2e3r4@localhost:5433/face_attendance_test")
 
 
 @pytest.fixture(scope="session")
@@ -53,10 +49,17 @@ _CLIENT: TestClient  # type: ignore[assignment]
 
 
 def _bootstrap() -> None:
+    import sqlalchemy as sa
+
     from app.core.security import generate_api_key, hash_api_key
     from app.db import Base, SessionLocal, engine
     from app.engine.defaults import DEFAULTS
     from app.models import ApiKey, SystemSetting  # noqa: F401
+
+    # Create pgvector extension before creating tables that use Vector type.
+    with engine.connect() as conn:
+        conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
 
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)

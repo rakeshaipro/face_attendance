@@ -15,7 +15,7 @@ from pathlib import Path
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.config import BACKUP_DIR, DATA_DIR, DB_PATH, SNAPSHOT_DIR
+from app.config import BACKUP_DIR, DATA_DIR, SNAPSHOT_DIR
 from app.core.enums import EVENT_CAMERA_OFFLINE, EVENT_STORAGE_LOW
 from app.core.settings_store import get_bool, get_int, get_value
 from app.events import bus
@@ -131,9 +131,7 @@ def purge_system_logs(db: Session) -> int:
     days = get_int(db, "system.log_retention_days")
     if days <= 0:
         return 0
-    # SQLite stores timezone-aware datetimes as naive UTC strings. Use a
-    # naive UTC cutoff so the ORM evaluator can compare consistently.
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     stmt = delete(SystemLog).where(SystemLog.created_at < cutoff)
     result = db.execute(stmt)
     db.commit()

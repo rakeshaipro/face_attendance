@@ -128,12 +128,11 @@ class TestRetentionPurge:
             _set(db, "system.log_retention_days", "7")
             old = write_system_log(db, event="old.event", message="old", severity="info")
             old_id = old.id
-            # Manually backdate the row. SQLite stores timezone-aware datetimes as
-            # strings; supply a naive UTC datetime to match the stored format.
+            # Manually backdate the row.
             db.execute(
                 SystemLog.__table__.update()
                 .where(SystemLog.id == old_id)
-                .values(created_at=(datetime.now(timezone.utc) - timedelta(days=10)).replace(tzinfo=None))
+                .values(created_at=datetime.now(timezone.utc) - timedelta(days=10))
             )
             db.commit()
             new = write_system_log(db, event="new.event", message="new", severity="info")

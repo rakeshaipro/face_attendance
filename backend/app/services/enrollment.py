@@ -154,13 +154,15 @@ def capture(
         )
     ).scalar_one_or_none()
     image_rel = _save_capture_image(employee.id, step, frame)
-    embedding_json = json.dumps(det.embedding.astype(float).tolist())
+    embedding_list = det.embedding.astype(float).tolist()
+    embedding_json = json.dumps(embedding_list)
 
     if existing is None:
         row = FaceEmbedding(
             id=uuid.uuid4().hex,
             employee_id=employee.id,
             pose_step=step,
+            embedding_vec=embedding_list,
             embedding_json=embedding_json,
             image_path=image_rel,
             quality_score=qr.score,
@@ -169,6 +171,7 @@ def capture(
         )
         db.add(row)
     else:
+        existing.embedding_vec = embedding_list
         existing.embedding_json = embedding_json
         existing.image_path = image_rel
         existing.quality_score = qr.score
@@ -252,7 +255,7 @@ def verify(
     captures = _list_captures(db, employee.id)
     if not captures:
         return VerifyResult(face_detected=True, best_score=None, threshold=threshold, matched=False)
-    best = max(cosine_similarity(embedding, np.array(json.loads(c.embedding_json), dtype=np.float32)) for c in captures)
+    best = max(cosine_similarity(embedding, np.array(c.embedding_vec, dtype=np.float32)) for c in captures)
     return VerifyResult(face_detected=True, best_score=round(best, 4), threshold=threshold, matched=best >= threshold)
 
 

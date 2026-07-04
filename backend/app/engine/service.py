@@ -11,7 +11,6 @@ loop. Communication with async land happens through `events.bus`.
 """
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -30,7 +29,7 @@ from app.db import SessionLocal
 from app.engine.face_provider import FaceProvider, get_provider
 from app.engine.frame_source import FrameSource
 from app.engine.matcher import best_match
-from app.models import Employee, FaceEmbedding
+from app.models import Employee
 from app.services.attendance import write_detection
 from app.services.cooldown import CooldownTracker
 
@@ -64,9 +63,6 @@ class RecognitionService:
         self._provider: FaceProvider | None = None
         self._stats = _Stats()
         self._camera_url: str | None = None
-        # Gallery cache (§3.4.5) — populated by load_gallery().
-        self._gallery_cache: list[tuple[str, np.ndarray]] | None = None
-        self._gallery_cache_ts: float = 0.0
         # Per-employee cooldown (§3.4.9).
         self._cooldown = CooldownTracker()
         # Hot-reloaded engine settings (§3.4.12) — refreshed on a TTL.
@@ -147,42 +143,9 @@ class RecognitionService:
             self._source = FrameSource(self._camera_url)
         return self._source.read() if self._source else None
 
-    # --- gallery (built now, consumed by the recognition loop in Phase 3) -
-    def load_gallery(self, db: Session | None = None) -> list[tuple[str, np.ndarray]]:
-        """Return [(employee_internal_id, embedding)] for every embedding of
-        every active, non-blocked, enrolled employee.
-
-        Used by the recognition loop (Phase 3) to match detected faces.
-        Results are cached with a 5-second TTL; `invalidate_gallery()`
-        forces a reload on enrollment changes.
-        """
-        now = time.monotonic()
-        if self._gallery_cache is not None and (now - self._gallery_cache_ts) < 5.0:
-            return self._gallery_cache
-
-        own_session = db is None
-        if own_session:
-            db = SessionLocal()
-        try:
-            rows = db.execute(
-                select(FaceEmbedding.employee_id, FaceEmbedding.embedding_json)
-                .join(Employee, Employee.id == FaceEmbedding.employee_id)
-                .where(Employee.is_active.is_(True), Employee.is_blocked.is_(False), Employee.is_enrolled.is_(True))
-            ).all()
-        finally:
-            if own_session:
-                db.close()
-
-        gallery: list[tuple[str, np.ndarray]] = [
-            (eid, np.array(json.loads(ej), dtype=np.float32)) for eid, ej in rows
-        ]
-        self._gallery_cache = gallery
-        self._gallery_cache_ts = now
-        return gallery
-
     def invalidate_gallery(self) -> None:
-        self._gallery_cache = None
-        self._gallery_cache_ts = 0.0
+        """No-op retained for backward compatibility (enrollment service calls it)."""
+        pass
 
     # --- main loop ----------------------------------------------------
     def _refresh_settings(self, db: Session) -> None:
@@ -233,16 +196,12 @@ class RecognitionService:
             if not detections:
                 return 0
 
-            gallery = self.load_gallery(db)
-            if not gallery:
-                return 0
-
             # Cache employee rows for this frame to avoid re-querying.
             seen: dict[str, Employee | None] = {}
             for det in detections:
                 if det.embedding is None:
                     continue
-                match = best_match(det.embedding, gallery)
+                match = best_match(det.embedding, db)
                 if match is None or match.score < self._threshold:
                     # Below threshold — silently discard (§3.4.6, §3.4.8).
                     continue

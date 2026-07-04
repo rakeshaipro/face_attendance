@@ -6,7 +6,7 @@ import type { PoseStep } from "@/lib/types";
 import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Spinner } from "@/components/ui";
 import { ErrorBanner } from "@/components/shared";
 import { FacePoseGuide } from "@/components/FacePoseGuide";
-import { Camera, CheckCircle2, ChevronDown, ChevronUp, Focus, Lightbulb, Maximize2, RotateCcw, ScanFace, Sun, Trash2 } from "lucide-react";
+import { Camera, CheckCircle2, ChevronDown, ChevronUp, Focus, Lightbulb, Maximize2, RotateCcw, ScanFace, Sun, Trash2, Video } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface EnrollmentProps {
@@ -126,6 +126,12 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
   const [active, setActive]           = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [tipsOpen, setTipsOpen]       = useState(true);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [switching, setSwitching]     = useState(false);
+  // True once the user has kicked off a re-enroll on an already-enrolled
+  // employee, lifting the lock on camera/capture controls until finalize.
+  const [reEnrollInitiated, setReEnrollInitiated] = useState(false);
 
   const steps = protocol?.steps ?? [];
   const step: PoseStep | undefined = steps.find((s) => s.step === currentStep);
@@ -134,8 +140,18 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
   capturedRef.current = new Set(status.data?.steps_captured ?? []);
   const captured = capturedRef.current; // alias for JSX
 
+  // --- enumerate available video input devices ---
+  const enumerateCameras = useCallback(async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setVideoDevices(devices.filter((d) => d.kind === "videoinput"));
+    } catch {
+      /* enumerateDevices not supported — dropdown stays hidden */
+    }
+  }, []);
+
   // --- start/stop camera ---
-  const startCamera = useCallback(async () => {
+  const startCamera = useCallback(async (deviceId?: string) => {
     setCamError(null);
     // Reset blink state
     brightnessHistRef.current = [];
@@ -144,17 +160,65 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
     blinkFiredRef.current     = false;
     latestValidPoseRef.current = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+      const id = deviceId ?? selectedDeviceId;
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, ...(id ? { deviceId: { exact: id } } : {}) },
+        audio: false,
+      });
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
+      // Permission has now been granted → labels are available.
+      await enumerateCameras();
+      // Remember the device the stream actually opened (default if none selected).
+      const activeId = stream.getVideoTracks()[0]?.getSettings().deviceId ?? null;
+      setSelectedDeviceId(activeId);
       setActive(true);
     } catch (e) {
       setCamError(e instanceof Error ? e.message : "Could not access webcam. (Requires HTTPS or localhost.)");
     }
+  }, [enumerateCameras, selectedDeviceId]);
+
+  // --- switch the active camera without leaving the capture loop ---
+  const switchCamera = useCallback(async (deviceId: string) => {
+    setSwitching(true);
+    try {
+      // Tear down the current stream so the device is released.
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      // Reset blink state — the stream swap would otherwise confuse detection.
+      brightnessHistRef.current = [];
+      blinkStateRef.current     = "open";
+      blinkStartTimeRef.current = null;
+      blinkFiredRef.current     = false;
+      latestValidPoseRef.current = null;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, deviceId: { exact: deviceId } },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setSelectedDeviceId(deviceId);
+    } catch (e) {
+      setCamError(e instanceof Error ? e.message : "Could not switch camera.");
+    } finally {
+      setSwitching(false);
+    }
   }, []);
+
+  // Refresh the device list on plug/unplug (Google-Meet behavior) and on mount.
+  useEffect(() => {
+    if (!navigator.mediaDevices?.addEventListener) return;
+    const handler = () => { void enumerateCameras(); };
+    navigator.mediaDevices.addEventListener("devicechange", handler);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", handler);
+  }, [enumerateCameras]);
 
   const stopCamera = useCallback(() => {
     setActive(false);
@@ -305,6 +369,7 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
     try {
       const res = await finalize.mutateAsync();
       setFinalResult({ overall: res.overall_quality, warning: res.warning });
+      setReEnrollInitiated(false);
       stopCamera();
     } catch (e) {
       setFinalResult({ overall: 0, warning: e instanceof Error ? e.message : "Finalize failed." });
@@ -330,6 +395,7 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
 
   const onReEnroll = async () => {
     await reEnroll.mutateAsync();
+    setReEnrollInitiated(true);
     setFinalResult(null);
     setCurrentStep(1);
   };
@@ -342,6 +408,9 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
   };
 
   // ── Derived UI flags ────────────────────────────────────────────────────────
+  // An enrolled employee is locked until the user explicitly re-enrolls; this
+  // prevents mutating a finalized enrollment (camera start, capture, finalize).
+  const locked = !!status.data?.is_enrolled && !reEnrollInitiated;
   const faceDetected = live !== null && live.yaw !== null;
   const inRange      = live?.inRange ?? false;
   const blinkReady   = faceDetected && inRange && !captured.has(currentStep) && !captureLockRef.current;
@@ -492,9 +561,15 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
           {!active && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-white/80">
               <Camera className="h-10 w-10" />
-              <Button size="sm" onClick={startCamera}>
-                Start camera
-              </Button>
+              {locked ? (
+                <p className="max-w-xs text-center text-sm text-white/70">
+                  Already enrolled. Click <span className="font-medium text-white">Re-enroll</span> to start over.
+                </p>
+              ) : (
+                <Button size="sm" onClick={() => startCamera()}>
+                  Start camera
+                </Button>
+              )}
             </div>
           )}
 
@@ -756,12 +831,31 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
                 Stop camera
               </Button>
             ) : (
-              <Button variant="outline" size="sm" onClick={startCamera} className="gap-2">
+              <Button variant="outline" size="sm" onClick={() => startCamera()} disabled={locked} className="gap-2">
                 <Camera className="h-4 w-4" /> Start
               </Button>
             )}
+            {/* Camera source selector — only when multiple cameras are available (Google-Meet style) */}
+            {active && videoDevices.length > 1 && (
+              <div className="relative flex items-center">
+                <Video className="pointer-events-none absolute left-2.5 h-4 w-4 text-muted-foreground" />
+                <select
+                  value={selectedDeviceId ?? ""}
+                  onChange={(e) => void switchCamera(e.target.value)}
+                  disabled={switching}
+                  className="h-8 rounded-md border border-input bg-background py-0 pl-8 pr-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Select camera"
+                >
+                  {videoDevices.map((d, i) => (
+                    <option key={d.deviceId || i} value={d.deviceId}>
+                      {d.label || `Camera ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
             {!step?.mandatory && (
-              <Button variant="ghost" size="sm" onClick={() => setCurrentStep((s) => Math.min(7, s + 1))}>
+              <Button variant="ghost" size="sm" onClick={() => setCurrentStep((s) => Math.min(7, s + 1))} disabled={locked}>
                 Skip step
               </Button>
             )}
@@ -770,7 +864,7 @@ export function Enrollment({ employeeId }: EnrollmentProps) {
             <Button
               size="sm"
               onClick={onFinalize}
-              disabled={finalize.isPending || (status.data?.capture_count ?? 0) < 5}
+              disabled={locked || finalize.isPending || (status.data?.capture_count ?? 0) < 5}
             >
               {finalize.isPending ? <Spinner className="h-4 w-4" /> : "Finalize enrollment"}
             </Button>

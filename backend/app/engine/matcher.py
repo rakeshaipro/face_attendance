@@ -1,14 +1,20 @@
 """Cosine similarity matching against enrolled embeddings (SRS §3.4.5).
 
-Implemented now (it is pure numpy) but wired into the recognition
-pipeline in a later slice. The engine service in this slice uses
-`get_provider().detect()` to prove the provider path end-to-end.
+Uses pgvector HNSW index for approximate nearest-neighbour search, replacing
+the previous brute-force numpy scan. The query runs inside PostgreSQL via the
+`<=>` cosine-distance operator, which leverages the HNSW index on
+`face_embeddings.embedding_vec`.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models.employee import Employee
+from app.models.face_embedding import FaceEmbedding
 
 
 def _l2_normalise(v: np.ndarray) -> np.ndarray:
@@ -17,6 +23,7 @@ def _l2_normalise(v: np.ndarray) -> np.ndarray:
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Pure-numpy cosine similarity — still used by enrollment verify()."""
     a = _l2_normalise(a.astype(np.float32))
     b = _l2_normalise(b.astype(np.float32))
     return float(np.dot(a, b))
@@ -28,16 +35,24 @@ class MatchResult:
     score: float
 
 
-def best_match(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> MatchResult | None:
+def best_match(embedding: np.ndarray, db: Session) -> MatchResult | None:
     """Return the highest-scoring (employee_id, score) from the gallery.
 
-    `gallery` is a list of (employee_id, embedding) tuples. Returns None
-    when the gallery is empty.
+    Uses pgvector's `<=>` cosine-distance operator with an HNSW index for
+    sub-millisecond ANN search at 100+ employee scale.
     """
-    if not gallery:
+    vec = embedding.tolist()
+    row = db.execute(
+        select(
+            FaceEmbedding.employee_id,
+            (1 - FaceEmbedding.embedding_vec.cosine_distance(vec)).label("similarity"),
+        )
+        .join(Employee, Employee.id == FaceEmbedding.employee_id)
+        .where(Employee.is_active.is_(True), Employee.is_blocked.is_(False), Employee.is_enrolled.is_(True))
+        .order_by(FaceEmbedding.embedding_vec.cosine_distance(vec).asc())
+        .limit(1)
+    ).first()
+
+    if row is None:
         return None
-    best_eid, best_emb = max(
-        ((eid, emb) for eid, emb in gallery),
-        key=lambda item: cosine_similarity(embedding, item[1]),
-    )
-    return MatchResult(employee_id=best_eid, score=cosine_similarity(embedding, best_emb))
+    return MatchResult(employee_id=row.employee_id, score=float(row.similarity))
