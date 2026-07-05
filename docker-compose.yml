@@ -11,3 +11,45 @@ services:
       - "5433:5432"
     volumes:
       - ./pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    container_name: face_attendance_backend
+    restart: unless-stopped
+    # Load FA_ENCRYPTION_KEY (and any other app config) from the app .env.
+    # Values in `environment:` below take precedence over this file.
+    env_file: ./backend/.env
+    environment:
+      # Override DB URL — the .env points at localhost:5433, but inside the
+      # compose network the DB is reachable at the `db` service hostname.
+      FA_DATABASE_URL: postgresql+psycopg://postgres:q1w2e3r4@db:5432/face_attendance
+      FA_HOST: 0.0.0.0
+      FA_PORT: 8000
+      FA_AUTOSTART_ENGINE: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      # make the backend dir the container root
+      - ./backend:/app
+    depends_on:
+      - db
+
+  frontend:
+    build: ./frontend
+    container_name: face_attendance_frontend
+    restart: unless-stopped
+    command: sh -c "npm run dev -- --host 0.0.0.0"
+    environment:
+      # Vite dev-server proxy target — must be reachable from inside the
+      # frontend container, so use the docker-compose service name, not localhost.
+      VITE_BACKEND_URL: http://backend:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      # make the frontend dir the container root
+      - ./frontend:/app
+      # keep container-installed node_modules from being shadowed by the host's
+      - /app/node_modules
+      - ./nginxlogs:/var/log/nginx
+    depends_on:
+      - backend
