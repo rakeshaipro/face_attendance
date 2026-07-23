@@ -1,0 +1,13 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: face_attendance_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: q1w2e3r4
+      POSTGRES_DB: face_attendance
+    ports:
+      - "5433:5432"
+    volumes:
+      - ../pgdata:/var/lib/postgresql/data

@@ -1,0 +1,24 @@
+# Python build artefacts / caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+
+# Test artefacts
+.pytest_cache/
+tests/_test.db
+
+# Runtime data (lives in a volume / bind mount, not the image)
+data/
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets are injected at runtime via compose `env_file`, never baked in.
+.env

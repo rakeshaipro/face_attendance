@@ -1,0 +1,13 @@
+# Node build artefacts / caches
+node_modules/
+dist/
+.vite/
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# Local env (compose injects VITE_BACKEND_URL at runtime)
+.env
+.env.local
